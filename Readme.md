@@ -165,3 +165,116 @@ We enforce access control via Pre-Filtering with In-Memory Roaring Bitmaps in bo
 **The 5 Leak Channels People Usually Forget (Beyond the Chunk):**
 
 1. Semantic / Response Caches: If the HR VP asks about the Gurugram hub restructure and we cache that answer on the basis of query similarity then a supervisor asking about the Gurugram delay could end up hitting that cached response. *Fix:* Every cache key must contain HMAC(sorted(user_security_groups)).
+2. Pre-computed summaries: if a background job is summarising all the "Gurugram Hub" docs into a single digest chunk it could inadvertently take a restricted HR lay-off doc and put it into an operational summary. *Fix:* the summary chunks must have the intersection (i.e. the strictest) of the permissions of their source documents, not the union.
+
+3. Reranker & Debugging Logs: Plaintext chunks get sent to your cross-encoder rerankers or get dumped into your OpenTelemetry/Langfuse traces where engineers can then go and read the confidential payroll/HR data. *Fix:* Only log the doc_id and chunk_id in your traces, never log the raw text strings.
+
+4. Conversation memory: imagine a manager is moved from Finance to Operations at 2.00 PM. If they're still talking in the same WhatsApp thread at 1.30 PM (i.e. the same conversation thread from yesterday), the Finance numbers from yesterday will still be in the chat history context window. *Fix:* re-check the doc_id permissions on all the cited history turns for every new message and strip out any turn whose source doc the user no longer has access to.
+
+5. Embeddings of ultra-sensitive text: you can in fact leak information from M&A or HR termination lists even in the absence of the raw text via nearest neighbour probing. *Fix:* Keep the HR_CONFIDENTIAL and BOARD_ONLY documents in a physically separate index partition (ns_restricted) which is completely unmounted from the standard worker tokens.
+
+**How Permission Changes Take Effect in <= 15 Minutes:**
+
+We never re-embed chunks when permissions change. We split the "Who is in what group" (User -> Groups in Redis, updated via AD/HRMS webhooks every 60 seconds with a 5 minute TTL fallback) from "Which group can see which document" (Group -> Doc_ID Roaring Bitmaps in the vector shards, updated by a 5 minute delta listener on Drive/Freshdesk permissions). End to end propagation is 1-6 minutes, well within the 15 minute requirement.
+
+---
+
+### 4. Freshness & Delete Handling Across Messy Sources
+
+Different systems at Bharat Bazaar move at completely different speeds:
+
+* Orders & Refunds (<= 1 hour SLA): Debezium reads the Postgres/SAP binlog and streams into ClickHouse continuously (approx 2 minute lag).
+
+* Freshdesk, Salesforce & Courier dashboards (<=1 hour SLA): Inbound webhooks for the instant updates, with a 15 minute sliding window polling job as a fall back if the webhook fails.
+
+* Tally & Nightly Metabase exports (<= 24 hour SLA): go into an S3 bucket at midnight. A worker will SHA-256 hash each row/page and only put the delta in.
+
+* Someone emailing a Google Sheet or a WhatsApp export (<= 24 hour SLA) goes into a monitored inbox (ingest@bharatbazaar), gets parsed, checked for sender RBAC and is tagged as authority = UNVERIFIED_SHEET so it can never override the SAP/ClickHouse numbers.
+
+* When a file is deleted or a customer requests DPDP data erasure we immediately flip its bit to `0` in an in-memory Tombstone Bitmap (disappears from search results in <1 second) and then physically purge the vectors during our nightly HNSW segment compaction.
+
+**Showing Freshness to the User:** Every single response stamps the actual sync watermark of the sources it used right at the bottom:
+
+Data freshness: Orders/Refunds DB synced 6 mins ago (14:18 IST) | Policy docs synced 3 hrs ago. (Note: COD orders from the last 14 days may have pending courier return updates).*
+
+---
+
+### 5. Quality, Regressions, Monitoring, and Cost Cuts
+
+* Before launch we build a 600 question evaluation set across all 6 languages (English, Hindi, Hinglish, Tamil, Malayalam, Bengali) against known SQL outputs and policy docs. It won't ship unless the unverified number hallucination rate is 0% and the cross role ACL leak rate is 0%.
+
+*Catching regressions: every PR that touches a prompt, router rule, embedding model or index config has to go through an automated replay of 200 golden queries. If a Tamil query which used to go to DOC-POL-003 suddenly starts going to an old policy, or if the SQL query hash changes, the build will fail.
+
+* In production we track four main alarms: Verifier Rejection Rate (tells us if an LLM update has started making up numbers), Source Watermark Lag (pages us if the ClickHouse CDC is more than 45 mins behind SAP), p95 first token latency on 4G and Canary ACL probes.
+
+* Where we spend vs. where we live... Where We Cut:**
+
+*Spend:* On ClickHouse reliability, our deterministic verifier and keeping the SQ8 vectors in RAM to keep the latency low.
+
+* *Cut*: We don't send simple warehouse lookups off to a costly frontier model (our self hosted 8B/14B models do 85% of the work). We also skip the GPU cross-encoder reranker whenever the top-1 vector/BM25 hit is well ahead of the second hit (by >0.08) which halves our reranker GPU usage.
+
+* What is unsafe to cache: Never cache answers across different ACL bitmaps, never cache queries which contain any personal customer data (phone, email, order_id etc) and never cache time sensitive SQL aggregations for longer than the 5 minute CDC window.
+
+---
+
+---
+
+## Part B: Day 9 Crisis — Two Incidents Hit at Once
+
+Nine days in, two bad reports land on our desk:
+
+1. Incident 1: CFO Anand asked for Maharashtra's refund rate last quarter. He got 4.1% from a real Metabase PDF export and put that in the board pre-read. Finance says the actual figure is 6.3% as the late COD returns hadn't been posted at the time of that PDF export.
+
+2. Incident 2: A warehouse supervisor in Hyderabad was asking about delays on a particular shipment and got a one liner which was the summary of a confidential HR restructure in Gurugram.
+
+Then CEO Meenakshi texts: "Shall we switch it off? Do I need to let anyone outside the company know?"*
+
+---
+
+### 1. The First 60 Minutes (Step-by-Step + What We Tell Meenakshi)
+
+**Do we switch the whole assistant off?**
+
+No to a total blackout, **YES to an immediate kill-switch on Unstructured Document Search (RAG) and Caches.**
+
+If we kill the bot during Diwali week then 5,000 warehouse and ops staff lose live SQL order/shipment tracking. Instead we can flip `ENABLE_UNSTRUCTURED_RAG = False` in under 2 minutes and flush the Redis caches. The bot remains up in **Safe SQL-Only Mode** (only answering to governed order/courier database lookups) which completely eliminates any HR document leaks and stops the bot from quoting the stale PDF exports.
+
+**Chronological Runbook (Minutes 0 to 60):**
+
+* Min 0–5: Flip the RAG kill switch (SQL-Only Safe Mode on) and flush all semantic/response caches.
+
+* Min 5–15: Run a forensic trace on Incident 2's doc_id. Retrieve the actual Gurugram HR document text to determine whether it contains personal data of specific individuals (i.e. employee names, salaries, phone numbers, PAN) or merely high level facility headcount targets. Whilst doing this, go through all 9 days of the query logs to see if any other user has pulled chunks out of that HR folder.
+
+* Min 15–30: Pull Anand's exact query trace for Incident 1, check the 4.1% Metabase PDF timestamp against the 6.3% ClickHouse ledger query and write a 3 line Board Errata for Anand. Brief Meenakshi (CISO) and Legal Counsel.
+
+* Min 30–60: Blacklist all static BI/Metabase PDFs from answering metric questions, lock the HR_* document namespace at the gateway and rotate session tokens.
+
+**What I Say Aloud to Meenakshi (Talking Points):**
+
+Meenakshi first: within two minutes of the alert we'd locked the assistant into Safe SQL-Only Mode and wiped the response cache. Your warehouse teams can still look at the live order and courier tables so Diwali dispatch is absolutely not going to be impacted, but document retrieval is completely paused until we've finished our forensic check.*
+
+>
+
+> On Anand's 4.1% refund figure: the bot didn't make that number up. It simply read 4.1% from a Metabase PDF that had been exported prior to the late-arriving Maharashtra COD returns being posted in the ledger. That in turn pushed the final number to 6.3%. I've already sent Anand a clean 3-line reconciliation note for the board packet, and we've blocked static PDF exports from ever answering financial metric questions again.*
+
+>
+
+As to whether you need to tell anyone outside the company... that's down to two Indian regulations that I'm currently looking at with Legal and our CISO. One is CERT-In (6 hour reporting window for unauthorised access or a security incident). The other is India's DPDP Act 2023. If the Gurugram HR document in question contained any identifiable personal data of employees (i.e. names, salaries, a list of people being terminated etc) then we'd have a personal data breach and would be required to report that to the Data Protection Board and to the individuals concerned. If our forensic at minute 15 confirms it was just facility level restructuring notes with absolutely no personal data then DPDP external reporting isn't triggered. We'll have the exact file contents on your desk in ten minutes.*
+
+---
+
+### 2. Root Causes: Ranked Hypotheses, Fast Tests & Needed Logs
+
+#### Incident 1 (4.1% Metabase PDF vs 6.3% True Finance Figure)
+
+1. **Hypothesis 1 (Most Likely) — Router sent a KPI question to RAG instead of Governed SQL:**
+
+* *Why:* The router saw "Maharashtra" and "last quarter" and did a hybrid document search where the titled PDF (*"Maharashtra Q3 Refund Report.pdf"*) came up as #1.
+
+* *How to test in 5 minutes:* Check the query_router_logs for Anand's request_id to see what route was taken and what doc_ids were cited.
+
+2. **Hypothesis 2 — COD Return-to-Origin (RTO) Settlement Lag:**
+
+* Why: Half of Bharat Bazaar's orders are COD. An order shipped in late September takes 10–14 days to fail delivery, return to the hub and get booked as a refund. The Metabase PDF was exported on the 1st of October (`4.1%`), Finance's query to the ledger came after the COD returns had settled (`6.3%`).
+
+* *How to test
