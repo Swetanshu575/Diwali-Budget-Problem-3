@@ -19,46 +19,32 @@ So we split the traffic right at the front door using a lightweight **Intent & M
 ```text
 
 [User on 4G / WhatsApp UI] (English, Hindi, Hinglish, Tamil, Malayalam, Bengali)
-
-|
-
-v
-
-[Auth & Redis Entitlement Lookup] ---> Fetches user's active security_group_ids (5-min TTL)
-
-|
-
-v
-
-[Intent & Metric Router]
-
-|
-
-1. Pure Number or KPI Question ("refund rate last quarter", "Bhiwandi COD count")
-
-| Goes straight to the Governed SQL layer (ClickHouse). No vector search.
-
-| Uses pre-approved SQL templates which have been signed off by Finance.
-
-|
-
-+---> 2. Policy / SOP / Qualitative Ticket Question ("replacement policy", "why is Guwahati delayed")
-
-| Goes to Hybrid Search (BGE-M3 Dense + BM25 Sparse) with Roaring Bitmap ACL pre-filters.
-
-|
-
-+---> 3. "Why did a metric move?" (Multi-hop like Farah's war-room query)
-
-Fires both in parallel: ClickHouse gets the real numbers, RAG pulls the Freshdesk/warehouse
-
-tickets to explain what actually happened on the ground.
-
-|
-
-v
-
-[Deterministic Code Verifier + Freshness Watermark Stamper] ---> Streams back over SSE / WhatsApp
+                                       │
+                                       ▼
+   [Auth & Redis Entitlement Lookup] ──► Fetches active security_group_ids (5-min TTL)
+                                       │
+                                       ▼
+                             [Intent & Metric Router]
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         ▼                             ▼                             ▼
+   [1. Pure Number / KPI]    [2. Policy / SOP / Ticket]    [3. Multi-Hop Diagnostic]
+   "refund rate last qtr"    "replacement policy..."       "Why did Tier-3 spike?"
+         │                             │                             │
+         ▼                             ▼                             ▼
+    Governed SQL                  Hybrid Search              Parallel Execution
+    (ClickHouse)                 (BGE-M3 + BM25)             (ClickHouse + RAG)
+   • Zero vector search         • Roaring Bitmap ACL        • SQL pulls real numbers
+   • Pre-approved Finance         pre-filtering             • RAG pulls ticket
+     metric templates           • Policy & SOP chunks         context & root cause
+         │                             │                             │
+         └─────────────────────────────┼─────────────────────────────┘
+                                       │
+                                       ▼
+           [Deterministic Code Verifier + Freshness Watermark Stamper]
+                                       │
+                                       ▼
+                   Streams back to user over SSE / WhatsApp
 
 ```
 
