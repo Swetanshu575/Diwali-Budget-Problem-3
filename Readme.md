@@ -324,4 +324,3 @@ If you promise a CFO that the AI will "never give a wrong number" without defini
 
 * Why: Half of Bharat Bazaar's orders are COD. An order shipped in late September takes 10–14 days to fail delivery, return to the hub and get booked as a refund. The Metabase PDF was exported on the 1st of October (`4.1%`), Finance's query to the ledger came after the COD returns had settled (`6.3%`).
 
-* *How to test
