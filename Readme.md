@@ -273,7 +273,54 @@ As to whether you need to tell anyone outside the company... that's down to two 
 
 * *How to test in 5 minutes:* Check the query_router_logs for Anand's request_id to see what route was taken and what doc_ids were cited.
 
-2. **Hypothesis 2 — COD Return-to-Origin (RTO) Settlement Lag:**
+2. **Hypothesis 2 — COD Return-to-Origin (RTO) Settlement Lag:***How to test in 5 minutes:* Look in the retrieval_audit_log for that supervisor's request_id. Check the cache_hit = true/false and whether the leaked chunk_id was a synthetic summary chunk or a raw document chunk.
+2. **Hypothesis 2 — Ingestion Connector Defaulted to Public/All-Staff on Missing ACL:**
+   * Why: The Gurugram HR doc was pulled from an emailed file or a shared Drive link where the permission mapper couldn't resolve the HR group and defaulted to role:all_employees.
+   * *How to test in 5 mins:* Query the vector DB metadata table for that doc_id and print out its acl_security_groups bitmap.
+3. **Hypothesis 3 — BM25 Lexical Search Bypassed the Vector ACL Pre-Filter:**
+   * *Why:* The dense vector search correctly applied the Roaring Bitmap filter. The keyword/BM25 leg however searched the entire index for "shipment delays" and fed an unfiltered HR chunk (which stated "shipment delays expected during Gurugram restructuring") into the reranker pool.
+   * *Logs required:* retrieval_audit_log (user token groups, cache key, dense candidate IDs, BM25 candidate IDs and final reranked chunk IDs) and ingestion_acl_audit_log.
+
+---
+
+### 3. Containment (24 Hours), Real Fixes (6 Weeks), and What We Refuse to Ship
+
+* **Shipped Within 24 Hours:**
+  1. Hard block all PDFs, spreadsheets and email attachments from answering any numerical KPI questions (if the question is asking for a rate, a count or a rupee total then it must go to ClickHouse or else it must abstain).
+  2. Enforce Fail-Closed ACLs on both the Dense and BM25 search legs. Any document with NULL permissions or tagged HR / BOARD / LEGAL will be DENY'd by default unless the user's JWT has the appropriate department claim.
+  3. Turn off cross-user semantic caching and delete all pre-computed multi-document summary chunks.
+
+* **Shipped Within 6 Weeks:**
+  1. CFO signed off on the semantic metric layer: the top 50 company metrics (refund rate, GMV, COD RTO%, SLA breach%) are now locked into version controlled SQL views in ClickHouse.
+  2. Automated COD cohort maturity warning: if anyone asks you about a date range where >5% of the COD orders are still in flight or unsettled the SQL layer will automatically return both the settled rate and the in flight pending COD rate so that no-one ever quotes an immature number to the board.
+  3. Ingestion time PII & HR sensitivity scanner: a classifier which will quarantine any document that's just been ingested containing salary tables, headcount cuts or employee PII until the source ACL group has been verified.
+
+* **What We REFUSE to Ship:**
+  1. We are not going to "fix" the permissions by putting instructions in the LLM prompt (*"Please don't mention HR documents to warehouse supervisors"*). Prompts are not a mechanism for access control.
+  2. We won't have an LLM work out percentages or averages from text documents.
+  3. We won't ship "fail-open" permissions if Redis or Active Directory times out. If the auth check fails then the query fails closed.
+
+---
+
+### 4. Prevention: The Exact Test & Monitor That Would Have Caught Each Incident
+
+* **To Catch Incident 1 Before Anand Did:**
+  * Pre-launch CI test: 100 question "Financial KPI Routing Test" in which every question relating to refund rates, revenue or order counts must have route == GOVERNED_SQL and cited_unstructured_docs == 0.
+  * *Production Guardrail* A rule within our Deterministic Verifier which will block any response containing a % or ₹ metric if the source is an unstructured PDF/Sheet in the event that a matching governed SQL metric exists.
+* **To Catch Incident 2 Before the Supervisor Did:**
+  * Pre-launch CI test: Role matrix penetration test which replays 50 warehouse queries using a Hyderabad_Supervisor JWT against an index seeded with Gurugram_HR files and asserts 0 HR chunks in both the vector and BM25 candidate lists.
+  * *Production Monitor:* 5-Minute "Honey-Doc" Canary Probe — a background job using a low-privilege warehouse token to continually query the live index for the presence of keywords within the planted fake CANARY_HR_RESTRUCTURING documents. If any canary chunk ever returns a score > 0 it pages on-call and auto-trips the RAG kill-switch in seconds.
+
+---
+
+### 5. Turning Anand's "Mujhe Galat Number Nahi Chahiye" Into Honest, Measurable Promises
+
+If you promise a CFO that the AI will "never give a wrong number" without defining what happens when the accounting data itself is late to settle, you're once again going to end up with a failure. Here is how we turn Anand's requirement into four measurable SLAs we can actually keep:
+
+1. **0.0% Unverified Numbers (Enforced by Code Verifier):** The assistant will not output a number in a factual claim unless that number is matched by our Python verifier to either a recorded ClickHouse SQL result hash (SHA-256) or to a span in an active policy document.
+2. 100% SQL-only routing for business metrics. All of our KPIs (refund rates, GMV, SLA %s etc) are answered directly from the SQL. We never pull them from PDFs, emails or spreadsheets.
+3. Dual reporting on our unsettled COD cohorts. As half our orders are COD we automatically have two figures for any refund/revenue metric: Settled in Ledger (e.g. 4.1%) and Inclusive of in-flight / late COD returns (e.g. 6.3%) with the exact minute of the database sync.
+4. 100% abstention when data is missing or stale. If ClickHouse CDC is more than 60 minutes behind or if the metric isn't defined in the Finance approved SQL catalog then the bot will return CANNOT_DETERMINE and will state what is missing rather than make a guess.
 
 * Why: Half of Bharat Bazaar's orders are COD. An order shipped in late September takes 10–14 days to fail delivery, return to the hub and get booked as a refund. The Metabase PDF was exported on the 1st of October (`4.1%`), Finance's query to the ledger came after the COD returns had settled (`6.3%`).
 
