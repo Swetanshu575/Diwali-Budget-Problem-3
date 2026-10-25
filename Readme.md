@@ -7,6 +7,8 @@ This is a design report rather than an application implementation. The repositor
 
 ## Part A: Production Design
 
+![System Architecture Flowchart](architecture_flowchart.png)
+
 ### 1. Query Routing
 
 Not every query needs RAG. Questions about refund rates and business metrics are sent to governed SQL queries in ClickHouse. Policy, SOP, and ticket queries use hybrid search with BM25 and vector embeddings. Complex questions use both SQL and RAG to combine accurate numbers with supporting context.
